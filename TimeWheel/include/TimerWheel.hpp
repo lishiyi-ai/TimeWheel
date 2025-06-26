@@ -13,14 +13,16 @@ namespace TimeWheel {
 
 class TimerWheel {
 private:
-    int tick_duration; // 一次心跳间隔
-    int wheel_levels; // 时间级数
-    int wheel_size; // 时间轮槽数
-    int runwheel_loc = 0; // 当前执行时间轮位置
+    uint64_t tick_duration; // 一次心跳间隔
+    uint64_t current; // timer运行时间 单位毫秒
+    uint64_t current_point; // 系统时间
+    uint64_t wheel_levels; // 时间级数
+    uint64_t wheel_size; // 时间轮槽数
+    uint64_t runwheel_loc = 0; // 当前执行时间轮位置
     bool isrunning = false; // 是否正在运行
     std::mutex queue_mutex; // 任务队列
 
-    std::vector<int> wheel_level_loc;
+    std::vector<uint64_t> wheel_level_loc;
     std::vector<std::mutex>* wheel_mutex; // 时间轮锁
     std::vector<std::vector<DList<Timer>>> multiwheel; // 多级时间轮 levels * wheel_size
     DList<Timer> task_queue; // 任务队列
@@ -35,7 +37,7 @@ public:
         : tick_duration(tick_duration), wheel_levels(wheel_levels), wheel_size(wheel_size) {
         
         multiwheel.resize(wheel_levels);
-        wheel_mutex = new std::vector<std::mutex>(wheel_levels); // 初始化时间轮锁
+        wheel_mutex = new std::vector<std::mutex>(wheel_levels * wheel_size); // 初始化时间轮锁
         wheel_level_loc.resize(wheel_levels);
         runwheel_loc = 0; // 初始化当前执行时间轮位置
 
@@ -48,7 +50,7 @@ public:
     // 时间轮心跳函数
     void Tick(){
         std::cout << "Tick: " << std::endl;
-        std::lock_guard<std::mutex> run_lock((*wheel_mutex)[0]); // 锁定执行时间轮，防止并发访问
+        std::lock_guard<std::mutex> run_lock((*wheel_mutex)[wheel_level_loc[0]]); // 锁定执行时间轮，防止并发访问
         std::lock_guard<std::mutex> queue_lock(queue_mutex); // 锁定任务队列，防止并发访问
 
         task_queue.push_back_list(multiwheel[0][wheel_level_loc[0]]); // 获取当前执行时间轮的头节点
@@ -65,7 +67,7 @@ public:
         if(level >= wheel_levels) {
             return; // 如果超过了时间轮级数，直接返回
         }
-        std::unique_lock<std::mutex> lock((*wheel_mutex)[level]); // 锁定当前时间轮级别的锁
+        std::unique_lock<std::mutex> lock((*wheel_mutex)[level*wheel_size + wheel_level_loc[level]]); // 锁定当前时间轮级别的锁
 
         DList<Timer> list(multiwheel[level][wheel_level_loc[level]]);
 
@@ -100,23 +102,48 @@ public:
         int ticks = timer->ticks;
         int level_size = 1;
         for(int i = 0; i < wheel_levels; ++i) {
-            std::lock_guard<std::mutex> lock((*wheel_mutex)[i]); // 锁定当前时间轮级别的锁
             ticks = ticks + wheel_level_loc[i]; // 计算新的ticks
             if(ticks <= wheel_size || i == wheel_levels - 1) {
-                bind_to_list(timer, multiwheel[i][(ticks - 1) % wheel_size], (*wheel_mutex)[i]); // 将定时器绑定到多级时间轮
+                std::lock_guard<std::mutex> lock((*wheel_mutex)[(ticks - 1) % wheel_size + i * wheel_size]);
                 multiwheel[i][(ticks - 1) % wheel_size].push_back(timer); // 将定时器添加到多级时间轮
                 return; // 添加成功，直接返回
             } else {
-                timer->ticks = timer->ticks - wheel_size * level_size;
+                timer->ticks = timer->ticks - (wheel_size - wheel_level_loc[i]) * level_size;
                 level_size *= wheel_size;
                 ticks = ticks / wheel_size;
             }
         }
     }
 
-    void bind_to_list(std::shared_ptr<Timer> timer, DList<Timer>& list, std::mutex& _mtx) {
-        timer->timer_list = &list;
-        timer->mutex = &_mtx;
+    uint64_t gettime(){ // 单位为微秒
+        uint64_t t;
+    #if !defined(__APPEL__) || defined(AVAILABLE_MAC_OS_XVERSION_10_12_AND_LATER)
+        struct timespec ti;
+        clock_gettime(CLOCK_MONOTONIC, &ti); // 自系统启动以来的时间
+        t = (uint64_t)ti.tv_sec * 1000;
+        t += ti.tv_nsec / 1000000;
+    #else 
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        t = (uint64_t)tv.tv_sec * 1000000;
+        t += tv.tv_usec;
+    #endif
+        return t;
+    }
+    void update_time(){
+        uint64_t cp = gettime();
+        uint64_t delta = cp - current_point;
+        if(delta >= tick_duration){
+            
+            current_point = cp;
+            current +=delta;
+            uint32_t diff = (uint32_t)(delta / tick_duration);
+
+            int i;
+            for(int i = 0; i < diff; ++i){
+                Tick();
+            }
+        }
     }
 
     void start(){
@@ -124,9 +151,10 @@ public:
             return; // 如果已经在运行，直接返回
         }
         isrunning = true; // 设置为正在运行状态
+        current_point = gettime();
         threadtime = std::thread([this]() {
             while (isrunning) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(tick_duration));
+                std::this_thread::sleep_for(std::chrono::milliseconds(tick_duration / 4));
                 Tick();
             }
         });
@@ -151,11 +179,12 @@ public:
             if(timer == nullptr) {
                 continue; // 继续下一次循环
             }
+            if(!timer->isvalid) { // 如果定时器仍然有效
+                continue;
+            }
+            timer->handler();
             if(timer->islong == 1){
                 add_timer(timer); // 如果是长定时器，重新添加到时间轮
-            }
-            if(timer->isvalid) { // 如果定时器仍然有效
-                timer->handler(); // 执行定时器的回调函数
             }
         }
     }

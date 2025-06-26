@@ -14,8 +14,6 @@ private:
     int delay; // ms单位延迟
     std::function<void()> callback; // 回调函数
 public:
-    DList<Timer>* timer_list; // 定时器链表
-    std::mutex* mutex; // 访问互斥锁
 
     int ticks; // 换算后的实际ticks
     int islong; // 0: short, 1: long;
